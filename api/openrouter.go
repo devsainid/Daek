@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/sashabaranov/go-openai"
 	"io"
 	"log"
+	"net/http"
 	"openrouter-gpt-telegram-bot/config"
 	"openrouter-gpt-telegram-bot/user"
+	"path/filepath"
+	"strings"
 	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/sashabaranov/go-openai"
 )
 
 func HandleChatGPTStreamResponse(bot *tgbotapi.BotAPI, client *openai.Client, message *tgbotapi.Message, config *config.Config, user *user.UsageTracker) string {
@@ -33,9 +37,21 @@ func HandleChatGPTStreamResponse(bot *tgbotapi.BotAPI, client *openai.Client, me
 	if config.Vision == "true" {
 		messages = append(messages, addVisionMessage(bot, message, config))
 	} else {
+		// Check if message has a document attachment
+		messageContent := message.Text
+		if message.Document != nil {
+			fileContent, err := getDocumentContent(bot, message.Document)
+			if err == nil && isTextFile(message.Document.FileName) {
+				if messageContent != "" {
+					messageContent += "\n\n"
+				}
+				messageContent += "Content of attached file '" + message.Document.FileName + "':\n\n" + fileContent
+			}
+		}
+
 		messages = append(messages, openai.ChatCompletionMessage{
 			Role:    openai.ChatMessageRoleUser,
-			Content: message.Text,
+			Content: messageContent,
 		})
 	}
 	req := openai.ChatCompletionRequest{
@@ -71,7 +87,19 @@ func HandleChatGPTStreamResponse(bot *tgbotapi.BotAPI, client *openai.Client, me
 		}
 		if errors.Is(err, io.EOF) {
 			fmt.Println("\nStream finished, response ID:", responseID)
-			user.AddMessage(openai.ChatMessageRoleUser, message.Text)
+			// Get the message content that was sent to the API
+			messageContent := message.Text
+			if message.Document != nil {
+				fileContent, err := getDocumentContent(bot, message.Document)
+				if err == nil && isTextFile(message.Document.FileName) {
+					if messageContent != "" {
+						messageContent += "\n\n"
+					}
+					messageContent += "Content of attached file '" + message.Document.FileName + "':\n\n" + fileContent
+				}
+			}
+
+			user.AddMessage(openai.ChatMessageRoleUser, messageContent)
 			user.AddMessage(openai.ChatMessageRoleAssistant, messageText)
 			editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, lastMessageID, messageText)
 			_, err := bot.Send(editMsg)
@@ -182,9 +210,21 @@ func handleChatGPTResponse(bot *tgbotapi.BotAPI, client *openai.Client, message 
 			Content: msg.Content,
 		})
 	}
+	// Check if message has a document attachment
+	messageContent := message.Text
+	if message.Document != nil {
+		fileContent, err := getDocumentContent(bot, message.Document)
+		if err == nil && isTextFile(message.Document.FileName) {
+			if messageContent != "" {
+				messageContent += "\n\n"
+			}
+			messageContent += "Content of attached file '" + message.Document.FileName + "':\n\n" + fileContent
+		}
+	}
+
 	messages = append(messages, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
-		Content: message.Text,
+		Content: messageContent,
 	})
 
 	req := openai.ChatCompletionRequest{
@@ -193,6 +233,7 @@ func handleChatGPTResponse(bot *tgbotapi.BotAPI, client *openai.Client, message 
 		Temperature: float32(config.Model.Temperature),
 		Messages:    messages,
 	}
+
 	ctx := context.Background()
 	resp, err := client.CreateChatCompletion(ctx, req)
 	if err != nil {
@@ -207,4 +248,51 @@ func handleChatGPTResponse(bot *tgbotapi.BotAPI, client *openai.Client, message 
 	user.AddMessage(openai.ChatMessageRoleAssistant, answer)
 	bot.Send(msg)
 	return resp.ID
+}
+
+// Helper function to check if a file is a text file based on its extension
+func isTextFile(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	textExtensions := []string{".txt", ".md", ".csv", ".json", ".xml", ".html", ".css", ".js", ".go", ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".log"}
+
+	for _, textExt := range textExtensions {
+		if ext == textExt {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Helper function to download and get the content of a document
+func getDocumentContent(bot *tgbotapi.BotAPI, document *tgbotapi.Document) (string, error) {
+	// Get file info
+	fileConfig := tgbotapi.FileConfig{
+		FileID: document.FileID,
+	}
+	file, err := bot.GetFile(fileConfig)
+	if err != nil {
+		log.Printf("Error getting file: %v", err)
+		return "", err
+	}
+
+	// Get file URL
+	fileURL := file.Link(bot.Token)
+
+	// Download file content
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		log.Printf("Error downloading file: %v", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Read file content
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading file content: %v", err)
+		return "", err
+	}
+
+	return string(content), nil
 }
